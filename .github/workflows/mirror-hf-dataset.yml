@@ -1,0 +1,110 @@
+name: Mirror Hugging Face dataset
+run-name: Mirror ${{ inputs.dataset_id }} @ ${{ inputs.revision }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset_id:
+        description: Hugging Face dataset ID (owner/name)
+        required: true
+        default: vidore/vidore_v3_finance_en
+        type: string
+      revision:
+        description: Hugging Face branch, tag, or full commit SHA
+        required: true
+        default: main
+        type: string
+      release_tag:
+        description: Optional new GitHub release tag (blank generates a unique tag)
+        required: false
+        default: ''
+        type: string
+      asset_size_mib:
+        description: Maximum archive part size in MiB (1-1900)
+        required: true
+        default: 1900
+        type: number
+      max_workers:
+        description: Concurrent Hugging Face downloads (1-32)
+        required: true
+        default: 4
+        type: number
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hf-mirror-${{ inputs.dataset_id }}-${{ inputs.release_tag || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: write
+    steps:
+      - name: Check out workflow source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.12'
+
+      - name: Install Hugging Face client
+        run: python -m pip install --disable-pip-version-check -r requirements.txt
+
+      - name: Download every dataset file and prepare release assets
+        id: dataset
+        env:
+          DATASET_ID: ${{ inputs.dataset_id }}
+          HF_REVISION: ${{ inputs.revision }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          ASSET_SIZE_MIB: ${{ inputs.asset_size_mib }}
+          MAX_WORKERS: ${{ inputs.max_workers }}
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_HOME: ${{ runner.temp }}/hf-home
+          HF_HUB_DISABLE_TELEMETRY: '1'
+        run: |
+          python scripts/mirror_hf_dataset.py \
+            --dataset-id "$DATASET_ID" \
+            --revision "$HF_REVISION" \
+            --release-tag "$RELEASE_TAG" \
+            --asset-size-mib "$ASSET_SIZE_MIB" \
+            --max-workers "$MAX_WORKERS" \
+            --work-dir "$RUNNER_TEMP/hf-mirror"
+
+      - name: Upload assets and publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ steps.dataset.outputs.tag }}
+          RELEASE_TITLE: ${{ steps.dataset.outputs.title }}
+          TARGET_COMMIT: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          work_dir="$RUNNER_TEMP/hf-mirror"
+          # Creation fails if the tag already has a release; existing assets are never replaced.
+          gh release create "$RELEASE_TAG" --draft --latest=false \
+            --target "$TARGET_COMMIT" --title "$RELEASE_TITLE" \
+            --notes-file "$work_dir/RELEASE_NOTES.md"
+          for asset in "$work_dir/assets/"*; do
+            for attempt in 1 2 3 4 5; do
+              if gh release upload "$RELEASE_TAG" "$asset" --clobber; then
+                break
+              fi
+              if [ "$attempt" -eq 5 ]; then
+                echo "::error::Upload failed; the incomplete release remains a draft."
+                exit 1
+              fi
+              sleep "$((attempt * 5))"
+            done
+          done
+          gh release edit "$RELEASE_TAG" --draft=false --latest=false
+          release_url=$(gh release view "$RELEASE_TAG" --json url --jq .url)
+          printf 'Published release: %s\n' "$release_url"
+          printf '\n[Download the dataset release](%s)\n' "$release_url" >> "$GITHUB_STEP_SUMMARY"
